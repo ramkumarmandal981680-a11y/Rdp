@@ -1,0 +1,156 @@
+name: main
+
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-rdp:
+    runs-on: windows-2022
+    timeout-minutes: 350
+
+    steps:
+      - name: Configure Core RDP Settings
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Lsa' -Name "LimitBlankPasswordUse" -Value 0 -Force
+          netsh advfirewall firewall delete rule name="RDP-Tailscale"
+          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
+          Restart-Service -Name TermService -Force
+
+      - name: Create RDP User (Rayat) No Password
+        run: |
+          if (-not (Get-LocalUser -Name "Rayat" -ErrorAction SilentlyContinue)) {
+              New-LocalUser -Name "Rayat" -NoPassword -AccountNeverExpires
+          }
+          Set-LocalUser -Name "Rayat" -PasswordNeverExpires $true
+          $user = [ADSI]"WinNT://localhost/Rayat,user"
+          $user.Put("PasswordExpired", 0)
+          $user.SetInfo()
+          Add-LocalGroupMember -Group "Administrators" -Member "Rayat"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "Rayat"
+
+      - name: Create Config File for Rayat
+        run: |
+          $ConfigText = '[{"targets":[{"delayUnit":1,"delayValue":6,"duration":0,"type":0,"xPos":167,"xPos1":-1,"yPos":229,"yPos1":-1},{"delayUnit":0,"delayValue":300,"duration":0,"type":0,"xPos":611,"xPos1":-1,"yPos":457,"yPos1":-1},{"delayUnit":0,"delayValue":300,"duration":0,"type":0,"xPos":889,"xPos1":-1,"yPos":332,"yPos1":-1},{"delayUnit":0,"delayValue":300,"duration":0,"type":0,"xPos":708,"xPos1":-1,"yPos":499,"yPos1":-1},{"delayUnit":0,"delayValue":300,"duration":0,"type":0,"xPos":806,"xPos1":-1,"yPos":362,"yPos1":-1},{"delayUnit":0,"delayValue":300,"duration":0,"type":0,"xPos":801,"xPos1":-1,"yPos":383,"yPos1":-1},{"delayUnit":0,"delayValue":300,"duration":500,"type":1,"xPos":780,"xPos1":743,"yPos":222,"yPos1":158}],"antiDetection":true,"id":0,"name":"fix 960","numberOfCycles":10,"stopConditionChecked":0,"timeValue":300},{"targets":[{"delayUnit":1,"delayValue":6,"duration":0,"type":0,"xPos":202,"xPos1":-1,"yPos":305,"yPos1":-1},{"delayUnit":0,"delayValue":300,"duration":0,"type":0,"xPos":1194,"xPos1":-1,"yPos":504,"yPos1":-1},{"delayUnit":0,"delayValue":300,"duration":0,"type":0,"xPos":943,"xPos1":-1,"yPos":682,"yPos1":-1},{"delayUnit":0,"delayValue":300,"duration":0,"type":0,"xPos":816,"xPos1":-1,"yPos":613,"yPos1":-1},{"delayUnit":0,"delayValue":300,"duration":0,"type":0,"xPos":1050,"xPos1":-1,"yPos":501,"yPos1":-1},{"delayUnit":0,"delayValue":300,"duration":0,"type":0,"xPos":1077,"xPos1":-1,"yPos":532,"yPos1":-1},{"delayUnit":0,"delayValue":300,"duration":500,"type":1,"xPos":1093,"xPos1":1036,"yPos":383,"yPos1":337}],"antiDetection":false,"id":1,"name":"Config 1260","numberOfCycles":10,"stopConditionChecked":0,"timeValue":300}]'
+          $RayatDesktop = "C:\Users\Rayat\Desktop"
+          if (-not (Test-Path $RayatDesktop)) { New-Item -Path $RayatDesktop -ItemType Directory -Force }
+          Set-Content -Path "$RayatDesktop\Config.txt" -Value $ConfigText -Force
+          Set-Content -Path "C:\Users\Public\Desktop\Config.txt" -Value $ConfigText -Force
+          icacls "$RayatDesktop\Config.txt" /grant Rayat:F
+
+      - name: Install Tailscale
+        run: |
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.92.3-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
+
+      - name: Establish Tailscale Connection
+        run: |
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTHKEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
+          $tsIP = $null
+          $retries = 0
+          while (-not $tsIP -and $retries -lt 10) {
+              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+              Start-Sleep -Seconds 5
+              $retries++
+          }
+          if (-not $tsIP) { exit 1 }
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+
+      - name: Install Chocolatey and BlueStacks
+        run: |
+          Set-ExecutionPolicy Bypass -Scope Process -Force; 
+          iex ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
+          choco install bluestacks -y --silent --no-progress --params "'/Silent /NoRestart'" --timeout 900
+
+      - name: Download Free Fire APK
+        run: |
+          Invoke-WebRequest -Uri "https://dl.cdn.freefiremobile.com/live/package/FreeFire.apk" -OutFile "C:\Users\Public\FreeFire.apk"
+
+      - name: Launch BS, Install Apps & Inject Configs
+        run: |
+          # 1. Locate BlueStacks Directory and Tools
+          $bsPath = "C:\Program Files\BlueStacks_nxt"
+          if (-not (Test-Path $bsPath)) { $bsPath = "C:\Program Files\BlueStacks" }
+          
+          $player = "$bsPath\HD-Player.exe"
+          $adb = "$bsPath\HD-Adb.exe"
+          
+          if (-not (Test-Path $player)) { throw "BlueStacks Player not found!" }
+
+          # 2. Start BlueStacks Player
+          Write-Host "Starting BlueStacks Player..."
+          Start-Process $player
+          
+          # 3. Create Files Locally on Windows
+          $guestData = '{"guest_account_info":{"com.garena.msdk.guest_password":"SK_2GE1T_BY_SPIDEERIO_GAMING_3LBH6","com.garena.msdk.guest_uid":"4415388318"}}'
+          $localDatFile = "C:\Users\Public\guest100067.dat"
+          Set-Content -Path $localDatFile -Value $guestData -Force
+
+          $clickerData = '[{"targets":[{"delayUnit":0,"delayValue":300,"duration":0,"type":0,"xPos":145,"xPos1":-1,"yPos":245,"yPos1":-1},{"delayUnit":0,"delayValue":300,"duration":0,"type":0,"xPos":775,"xPos1":-1,"yPos":495,"yPos1":-1},{"delayUnit":0,"delayValue":300,"duration":0,"type":0,"xPos":922,"xPos1":-1,"yPos":502,"yPos1":-1},{"delayUnit":0,"delayValue":300,"duration":500,"type":1,"xPos":721,"xPos1":923,"yPos":252,"yPos1":246}],"antiDetection":false,"id":0,"name":"Config 0","numberOfCycles":10,"stopConditionChecked":0,"timeValue":300}]'
+          $localConfigFile = "C:\Users\Public\config.txt"
+          Set-Content -Path $localConfigFile -Value $clickerData -Force
+
+          # Download Auto Clicker APK (Direct Link)
+          Write-Host "Downloading Auto Clicker APK..."
+          Invoke-WebRequest -Uri "https://github.com/Shyamnpl/RDPv2/releases/download/v1.0/app.apk" -OutFile "C:\Users\Public\AutoClicker.apk"
+
+          # 4. Wait for BlueStacks Engine & Stabilize ADB
+          Write-Host "Waiting for Android Engine to boot..."
+          
+          # Reset ADB Server to prevent closed connection errors
+          & $adb kill-server
+          Start-Sleep -Seconds 2
+          & $adb start-server
+
+          $connected = $false
+          for ($i=0; $i -lt 40; $i++) {
+              Start-Sleep -Seconds 10
+              # Force connect to localhost
+              & $adb connect 127.0.0.1:5555
+              
+              $deviceStatus = & $adb devices
+              if ($deviceStatus -match "127.0.0.1:5555\s+device") {
+                  $connected = $true
+                  Write-Host "ADB Connected to BlueStacks!"
+                  break
+              }
+              Write-Host "Waiting for device connection... ($i/40)"
+          }
+
+          if (-not $connected) { throw "Failed to connect to BlueStacks via ADB" }
+
+          # IMPORTANT: Wait for Android OS to fully load before installing heavy apps
+          Write-Host "Waiting 20s for Android System to stabilize..."
+          Start-Sleep -Seconds 20
+
+          # 5. Install APKs via ADB (Using specific device target)
+          Write-Host "Installing Free Fire..."
+          & $adb -s 127.0.0.1:5555 install -r "C:\Users\Public\FreeFire.apk"
+          
+          Write-Host "Installing Auto Clicker..."
+          & $adb -s 127.0.0.1:5555 install -r "C:\Users\Public\AutoClicker.apk"
+
+          # 6. Inject Data Files
+          Write-Host "Injecting Guest Account Data..."
+          & $adb -s 127.0.0.1:5555 shell mkdir -p /storage/emulated/0/com.garena.msdk/
+          & $adb -s 127.0.0.1:5555 push $localDatFile /storage/emulated/0/com.garena.msdk/guest100067.dat
+          
+          Write-Host "Injecting Auto Clicker Config to Internal Storage..."
+          & $adb -s 127.0.0.1:5555 shell mkdir -p /sdcard/Download/
+          & $adb -s 127.0.0.1:5555 push $localConfigFile /sdcard/Download/config.txt
+          
+          Write-Host "All Installations and Injections Completed."
+
+      - name: Maintain Connection + Watch RDP User
+        run: |
+          Write-Host "`n=== RDP READY FOR RAYAT ==="
+          Write-Host "Address: $env:TAILSCALE_IP"
+          Write-Host "If the icon isn't visible, please wait 1-2 mins after connecting."
+          Write-Host "==========================`n"
+          while ($true) { Start-Sleep -Seconds 300 }
+          
